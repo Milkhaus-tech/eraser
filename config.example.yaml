@@ -21,6 +21,10 @@ email:
   provider: smtp
   from: john.doe@example.com
 
+  # Optional: where broker replies should go. Leave unset and replies land in
+  # the sending mailbox. Point it at a dedicated address to keep them out.
+  # reply_to: privacy@example.com
+
   # SMTP configuration (for Gmail, Outlook, etc.)
   smtp:
     host: smtp.gmail.com
@@ -39,6 +43,15 @@ options:
 
   # Delay between emails in milliseconds (avoid spam filters)
   rate_limit_ms: 2000
+
+  # Cooldown before contacting a broker that already accepted a request.
+  # Prevents every run re-emailing the whole list. -1 = never resend.
+  resend_after_days: 180
+
+  # Cap on emails per run, to stay under the provider's daily quota
+  # (Gmail allows 500/day). Remaining brokers roll over to the next run.
+  # -1 = uncapped.
+  max_per_run: 400
 
   # Only send to brokers in these regions (optional)
   # regions:

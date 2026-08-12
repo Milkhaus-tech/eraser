@@ -12,6 +12,7 @@ import (
 type Message struct {
 	To      string
 	From    string
+	ReplyTo string
 	Subject string
 	Body    string
 }
@@ -51,6 +52,11 @@ func validateMessage(msg Message) error {
 	}
 	if err := ValidateEmail(msg.To); err != nil {
 		return fmt.Errorf("invalid recipient: %w", err)
+	}
+	if msg.ReplyTo != "" {
+		if err := ValidateEmail(msg.ReplyTo); err != nil {
+			return fmt.Errorf("invalid reply-to: %w", err)
+		}
 	}
 	return nil
 }

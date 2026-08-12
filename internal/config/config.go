@@ -9,7 +9,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const defaultRateLimitMs = 2000
+const (
+	defaultRateLimitMs     = 2000
+	defaultResendAfterDays = 180
+	defaultMaxPerRun       = 400
+)
 
 func checkFilePermissions(path string) error {
 	if runtime.GOOS == "windows" {
@@ -72,6 +76,7 @@ func (p Profile) FullName() string { return p.FirstName + " " + p.LastName }
 type EmailConfig struct {
 	Provider string     `yaml:"provider"`
 	From     string     `yaml:"from"`
+	ReplyTo  string     `yaml:"reply_to,omitempty"`
 	SMTP     SMTPConfig `yaml:"smtp,omitempty"`
 }
 
@@ -91,6 +96,13 @@ type Options struct {
 	RateLimitMs     int      `yaml:"rate_limit_ms"`
 	Regions         []string `yaml:"regions"`
 	ExcludedBrokers []string `yaml:"excluded_brokers,omitempty"`
+
+	// ResendAfterDays is the cooldown before a broker already sent to is
+	// contacted again. Negative means never resend. 0 selects the default.
+	ResendAfterDays int `yaml:"resend_after_days"`
+	// MaxPerRun caps emails sent in a single run, keeping a run under the
+	// provider's daily quota. Negative means uncapped. 0 selects the default.
+	MaxPerRun int `yaml:"max_per_run"`
 }
 
 func DefaultConfigPath() string {
@@ -121,6 +133,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Options.RateLimitMs == 0 {
 		cfg.Options.RateLimitMs = defaultRateLimitMs
+	}
+	if cfg.Options.ResendAfterDays == 0 {
+		cfg.Options.ResendAfterDays = defaultResendAfterDays
+	}
+	if cfg.Options.MaxPerRun == 0 {
+		cfg.Options.MaxPerRun = defaultMaxPerRun
 	}
 
 	// Set inbox defaults

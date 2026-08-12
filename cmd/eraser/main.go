@@ -299,8 +299,25 @@ func runSend() error {
 
 	successCount := 0
 	failCount := 0
+	skipCount := 0
+	attempted := 0
 
 	for i, b := range brokers {
+		if cfg.Options.MaxPerRun >= 0 && attempted >= cfg.Options.MaxPerRun {
+			fmt.Printf("\n🛑 Reached max_per_run (%d); %d broker(s) deferred to the next run.\n",
+				cfg.Options.MaxPerRun, len(brokers)-i)
+			break
+		}
+
+		last, err := store.GetLastRequestForBroker(b.ID)
+		if err != nil {
+			fmt.Printf("  ⚠️  Could not read history for %s: %v\n", b.Name, err)
+		} else if shouldSkipBroker(last, cfg.Options.ResendAfterDays, time.Now()) {
+			skipCount++
+			continue
+		}
+
+		attempted++
 		fmt.Printf("[%d/%d] %s (%s)\n", i+1, len(brokers), b.Name, b.Email)
 
 		// Render email
@@ -320,6 +337,7 @@ func runSend() error {
 			msg := email.Message{
 				To:      b.Email,
 				From:    cfg.Email.From,
+				ReplyTo: cfg.Email.ReplyTo,
 				Subject: emailMsg.Subject,
 				Body:    emailMsg.Body,
 			}
@@ -352,22 +370,36 @@ func runSend() error {
 				fmt.Printf("  ⚠️  Failed to record history: %v\n", err)
 			}
 
-			// Rate limiting
-			if i < len(brokers)-1 {
-				time.Sleep(time.Duration(cfg.Options.RateLimitMs) * time.Millisecond)
-			}
+			// Rate limiting between real sends
+			time.Sleep(time.Duration(cfg.Options.RateLimitMs) * time.Millisecond)
 		}
 	}
 
 	fmt.Println()
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	if cfg.Options.DryRun {
-		fmt.Printf("📊 Dry run complete: %d brokers would receive emails\n", successCount)
+		fmt.Printf("📊 Dry run complete: %d would be emailed, %d skipped (cooldown)\n", successCount, skipCount)
 	} else {
-		fmt.Printf("📊 Complete: %d sent, %d failed\n", successCount, failCount)
+		fmt.Printf("📊 Complete: %d sent, %d failed, %d skipped (cooldown)\n", successCount, failCount, skipCount)
 	}
 
 	return nil
+}
+
+// shouldSkipBroker reports whether a broker was contacted recently enough that
+// re-sending would just generate another round of replies. Failed attempts are
+// always retried; a negative cooldown means never contact the same broker twice.
+func shouldSkipBroker(last *history.Record, resendAfterDays int, now time.Time) bool {
+	if last == nil || last.Status != history.StatusSent {
+		return false
+	}
+	if resendAfterDays < 0 {
+		return true
+	}
+	if last.SentAt.IsZero() {
+		return false
+	}
+	return now.Sub(last.SentAt) < time.Duration(resendAfterDays)*24*time.Hour
 }
 
 func runListBrokers() error {

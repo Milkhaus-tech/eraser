@@ -2,55 +2,168 @@ name: Eraser - Monthly Privacy Requests
 
 on:
   schedule:
-    # Run on the every sunday at midnight
-    - cron: '0 0 * * 0'
-  workflow_dispatch:  # Allow manual triggering
+    # 09:00 UTC on the 1st of each month.
+    - cron: '0 9 1 * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only — render emails but send nothing'
+        type: boolean
+        default: true
+
+# Never let a manual run overlap a scheduled one; a second sender would
+# duplicate every request the first is midway through.
+concurrency:
+  group: eraser-send
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   eraser:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Go
-        uses: actions/setup-go@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify required secrets
+        env:
+          ERASER_FIRST_NAME: ${{ secrets.ERASER_FIRST_NAME }}
+          ERASER_LAST_NAME: ${{ secrets.ERASER_LAST_NAME }}
+          ERASER_EMAIL: ${{ secrets.ERASER_EMAIL }}
+          ERASER_SMTP_HOST: ${{ secrets.ERASER_SMTP_HOST }}
+          ERASER_SMTP_PORT: ${{ secrets.ERASER_SMTP_PORT }}
+          ERASER_SMTP_USERNAME: ${{ secrets.ERASER_SMTP_USERNAME }}
+          ERASER_SMTP_PASSWORD: ${{ secrets.ERASER_SMTP_PASSWORD }}
+        run: |
+          missing=""
+          for name in ERASER_FIRST_NAME ERASER_LAST_NAME ERASER_EMAIL \
+                      ERASER_SMTP_HOST ERASER_SMTP_PORT ERASER_SMTP_USERNAME ERASER_SMTP_PASSWORD; do
+            eval "value=\${$name}"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required secrets:$missing"
+            exit 1
+          fi
+
       - name: Build Eraser
         run: go build -o eraser ./cmd/eraser
-      
-      - name: Create config directory
-        run: mkdir -p ~/.eraser
-      
-      - name: Create config file
+
+      - name: Restore request history
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cat > ~/.eraser/config.yaml << 'EOF'
-          profile:
-            first_name: ${{ secrets.ERASER_FIRST_NAME }}
-            last_name: ${{ secrets.ERASER_LAST_NAME }}
-            email: ${{ secrets.ERASER_EMAIL }}
-            address: ${{ secrets.ERASER_ADDRESS }}
-            city: ${{ secrets.ERASER_CITY }}
-            state: ${{ secrets.ERASER_STATE }}
-            zip_code: ${{ secrets.ERASER_ZIP_CODE }}
-            country: ${{ secrets.ERASER_COUNTRY }}
-            phone: ${{ secrets.ERASER_PHONE }}
-          
-          email:
-            provider: ${{ secrets.ERASER_EMAIL_PROVIDER }}
-            from: ${{ secrets.ERASER_SMTP_USERNAME }}
-            smtp:
-              host: ${{ secrets.ERASER_SMTP_HOST }}
-              port: ${{ secrets.ERASER_SMTP_PORT }}
-              username: ${{ secrets.ERASER_SMTP_USERNAME }}
-              password: ${{ secrets.ERASER_SMTP_PASSWORD }}
-              use_tls: true
-          
-          options:
-            template: ${{ secrets.ERASER_TEMPLATE }}
-            rate_limit_ms: 2000
-          EOF
-      
+          mkdir -p ~/.eraser
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow main.yml \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run_id" ] && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+               -n eraser-history -D ~/.eraser 2>/dev/null; then
+            echo "Restored history from run $run_id"
+          else
+            echo "::warning::No prior history found — treating every broker as uncontacted."
+          fi
+
+      - name: Write config
+        env:
+          ERASER_FIRST_NAME: ${{ secrets.ERASER_FIRST_NAME }}
+          ERASER_LAST_NAME: ${{ secrets.ERASER_LAST_NAME }}
+          ERASER_EMAIL: ${{ secrets.ERASER_EMAIL }}
+          ERASER_ADDRESS: ${{ secrets.ERASER_ADDRESS }}
+          ERASER_CITY: ${{ secrets.ERASER_CITY }}
+          ERASER_STATE: ${{ secrets.ERASER_STATE }}
+          ERASER_ZIP_CODE: ${{ secrets.ERASER_ZIP_CODE }}
+          ERASER_COUNTRY: ${{ secrets.ERASER_COUNTRY }}
+          ERASER_PHONE: ${{ secrets.ERASER_PHONE }}
+          ERASER_SMTP_HOST: ${{ secrets.ERASER_SMTP_HOST }}
+          ERASER_SMTP_PORT: ${{ secrets.ERASER_SMTP_PORT }}
+          ERASER_SMTP_USERNAME: ${{ secrets.ERASER_SMTP_USERNAME }}
+          ERASER_SMTP_PASSWORD: ${{ secrets.ERASER_SMTP_PASSWORD }}
+          ERASER_REPLY_TO: ${{ secrets.ERASER_REPLY_TO }}
+          ERASER_TEMPLATE: ${{ secrets.ERASER_TEMPLATE }}
+        run: |
+          umask 077
+          mkdir -p ~/.eraser
+          # JSON is valid YAML, and jq escapes every value correctly — no quoting
+          # traps from a colon or quote inside an address or password.
+          jq -n \
+            --arg first    "$ERASER_FIRST_NAME" \
+            --arg last     "$ERASER_LAST_NAME" \
+            --arg email    "$ERASER_EMAIL" \
+            --arg address  "$ERASER_ADDRESS" \
+            --arg city     "$ERASER_CITY" \
+            --arg state    "$ERASER_STATE" \
+            --arg zip      "$ERASER_ZIP_CODE" \
+            --arg country  "$ERASER_COUNTRY" \
+            --arg phone    "$ERASER_PHONE" \
+            --arg host     "$ERASER_SMTP_HOST" \
+            --argjson port "${ERASER_SMTP_PORT:-465}" \
+            --arg user     "$ERASER_SMTP_USERNAME" \
+            --arg pass     "$ERASER_SMTP_PASSWORD" \
+            --arg replyto  "$ERASER_REPLY_TO" \
+            --arg template "${ERASER_TEMPLATE:-generic}" \
+            '{
+              profile: {
+                first_name: $first, last_name: $last, email: $email,
+                address: $address, city: $city, state: $state,
+                zip_code: $zip, country: $country, phone: $phone
+              },
+              email: {
+                provider: "smtp",
+                from: $user,
+                reply_to: $replyto,
+                smtp: { host: $host, port: $port, username: $user, password: $pass, use_tls: true }
+              },
+              options: {
+                template: $template,
+                rate_limit_ms: 2000,
+                resend_after_days: 180,
+                max_per_run: 400
+              },
+              inbox: {
+                enabled: true,
+                provider: "gmail",
+                email: $user,
+                password: $pass,
+                folder: "INBOX",
+                auto_archive: true,
+                archive_folder: "Eraser"
+              }
+            }' > ~/.eraser/config.yaml
+
       - name: Send removal requests
-        run: ./eraser send
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            ./eraser send --dry-run
+          else
+            ./eraser send
+          fi
+
+      - name: File broker replies out of the inbox
+        # Best effort: emails are already sent, so an IMAP hiccup must not fail the run.
+        continue-on-error: true
+        run: ./eraser monitor --once --days 45
+
+      - name: Save request history
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp ~/.eraser/history.db artifact/history.db 2>/dev/null || echo "no history db to save"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eraser-history
+          path: artifact/history.db
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: warn
