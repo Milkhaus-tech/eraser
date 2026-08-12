@@ -82,6 +82,7 @@ jobs:
           ERASER_ZIP_CODE: ${{ secrets.ERASER_ZIP_CODE }}
           ERASER_COUNTRY: ${{ secrets.ERASER_COUNTRY }}
           ERASER_PHONE: ${{ secrets.ERASER_PHONE }}
+          ERASER_DATE_OF_BIRTH: ${{ secrets.ERASER_DATE_OF_BIRTH }}
           ERASER_SMTP_HOST: ${{ secrets.ERASER_SMTP_HOST }}
           ERASER_SMTP_PORT: ${{ secrets.ERASER_SMTP_PORT }}
           ERASER_SMTP_USERNAME: ${{ secrets.ERASER_SMTP_USERNAME }}
@@ -103,6 +104,7 @@ jobs:
             --arg zip      "$ERASER_ZIP_CODE" \
             --arg country  "$ERASER_COUNTRY" \
             --arg phone    "$ERASER_PHONE" \
+            --arg dob      "$ERASER_DATE_OF_BIRTH" \
             --arg host     "$ERASER_SMTP_HOST" \
             --argjson port "${ERASER_SMTP_PORT:-465}" \
             --arg user     "$ERASER_SMTP_USERNAME" \
@@ -113,7 +115,8 @@ jobs:
               profile: {
                 first_name: $first, last_name: $last, email: $email,
                 address: $address, city: $city, state: $state,
-                zip_code: $zip, country: $country, phone: $phone
+                zip_code: $zip, country: $country, phone: $phone,
+                date_of_birth: $dob
               },
               email: {
                 provider: "smtp",
