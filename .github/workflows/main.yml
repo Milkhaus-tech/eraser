@@ -71,6 +71,10 @@ jobs:
             echo "::warning::No prior history found — treating every broker as uncontacted."
           fi
 
+      - name: One-time history seed
+        if: github.event_name == 'workflow_dispatch' && hashFiles('data/history-seed.sql') != ''
+        run: python3 -c "import sqlite3,os; c=sqlite3.connect(os.path.expanduser('~/.eraser/history.db')); c.executescript(open('data/history-seed.sql').read()); c.commit(); print(c.execute('select count(*) from removal_requests').fetchone())"
+
       - name: Write config
         env:
           ERASER_FIRST_NAME: ${{ secrets.ERASER_FIRST_NAME }}
