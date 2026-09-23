@@ -138,6 +138,7 @@ func (s *Store) migrate() error {
 	// These must run before the index creation below
 	s.db.Exec(`ALTER TABLE removal_requests ADD COLUMN pipeline_status TEXT DEFAULT 'email_sent'`)
 	s.db.Exec(`ALTER TABLE pending_tasks ADD COLUMN opened_at DATETIME`)
+	s.db.Exec(`ALTER TABLE broker_responses ADD COLUMN email_body TEXT`)
 
 	query := `
 	CREATE TABLE IF NOT EXISTS removal_requests (
@@ -167,6 +168,7 @@ func (s *Store) migrate() error {
 		response_type TEXT NOT NULL,
 		email_from TEXT,
 		email_subject TEXT,
+		email_body TEXT,
 		form_url TEXT,
 		confirm_url TEXT,
 		confidence REAL,
