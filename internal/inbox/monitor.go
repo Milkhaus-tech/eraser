@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -24,17 +25,17 @@ type Monitor struct {
 
 // Email represents a parsed email from a broker
 type Email struct {
-	UID         uint32 // IMAP UID for operations like move/delete
-	MessageID   string
-	From        string
-	FromName    string // Sender display name (e.g., "Mail Delivery System")
-	FromDomain  string
-	Subject     string
-	Body        string
-	HTMLBody    string
-	ReceivedAt  time.Time
-	BrokerID    string // Matched broker ID (if found)
-	BrokerName  string // Matched broker name (if found)
+	UID        uint32 // IMAP UID for operations like move/delete
+	MessageID  string
+	From       string
+	FromName   string // Sender display name (e.g., "Mail Delivery System")
+	FromDomain string
+	Subject    string
+	Body       string
+	HTMLBody   string
+	ReceivedAt time.Time
+	BrokerID   string // Matched broker ID (if found)
+	BrokerName string // Matched broker name (if found)
 }
 
 // NewMonitor creates a new inbox monitor
@@ -88,7 +89,11 @@ func (m *Monitor) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to IMAP server: %w", err)
 	}
 
-	log.Printf("Connected, logging in as %s...", m.config.Email)
+	if os.Getenv("CI") == "" {
+		log.Printf("Connected, logging in as %s...", m.config.Email)
+	} else {
+		log.Printf("Connected, logging in...")
+	}
 
 	if err := c.Login(m.config.Email, m.config.Password); err != nil {
 		c.Logout()

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/eraser-privacy/eraser/internal/broker"
 )
 
 // ConfirmationResult holds the outcome of clicking a confirmation link
@@ -20,9 +22,34 @@ type ConfirmationResult struct {
 	RedirectPath []string
 }
 
+// BrokerDomains returns every trusted domain advertised for a broker. Hosts
+// from the website, form URL, and email address are all valid trust anchors.
+func BrokerDomains(brokers []broker.Broker) []string {
+	seen := make(map[string]bool)
+	var domains []string
+	add := func(host string) {
+		host = strings.ToLower(strings.TrimPrefix(host, "www."))
+		if host != "" && !seen[host] {
+			seen[host] = true
+			domains = append(domains, host)
+		}
+	}
+	for _, b := range brokers {
+		for _, raw := range []string{b.Website, b.OptOutURL} {
+			if u, err := url.Parse(raw); err == nil {
+				add(u.Hostname())
+			}
+		}
+		if at := strings.LastIndex(b.Email, "@"); at >= 0 {
+			add(b.Email[at+1:])
+		}
+	}
+	return domains
+}
+
 // ConfirmationHandler handles clicking confirmation links from emails
 type ConfirmationHandler struct {
-	client       *http.Client
+	client        *http.Client
 	brokerDomains map[string]bool
 }
 
@@ -67,11 +94,9 @@ func (h *ConfirmationHandler) ValidateDomain(confirmURL string) (bool, string, e
 		return false, "", fmt.Errorf("invalid URL: %w", err)
 	}
 
-	host := strings.ToLower(parsed.Host)
-
-	// Remove port if present
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
+	host := strings.ToLower(parsed.Hostname())
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || host == "" {
+		return false, host, fmt.Errorf("URL must use http or https and include a host")
 	}
 
 	// Check exact match
@@ -127,6 +152,12 @@ func (h *ConfirmationHandler) ClickConfirmationLink(confirmURL string, validateD
 	h.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return fmt.Errorf("too many redirects")
+		}
+		if validateDomain {
+			valid, _, err := h.ValidateDomain(req.URL.String())
+			if err != nil || !valid {
+				return fmt.Errorf("redirect target is not a known broker domain")
+			}
 		}
 		redirects = append(redirects, req.URL.String())
 		return nil

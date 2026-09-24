@@ -42,10 +42,12 @@ jobs:
           ERASER_SMTP_PORT: ${{ secrets.ERASER_SMTP_PORT }}
           ERASER_SMTP_USERNAME: ${{ secrets.ERASER_SMTP_USERNAME }}
           ERASER_SMTP_PASSWORD: ${{ secrets.ERASER_SMTP_PASSWORD }}
+          ERASER_HISTORY_KEY: ${{ secrets.ERASER_HISTORY_KEY }}
         run: |
           missing=""
           for name in ERASER_FIRST_NAME ERASER_LAST_NAME ERASER_EMAIL \
-                      ERASER_SMTP_HOST ERASER_SMTP_PORT ERASER_SMTP_USERNAME ERASER_SMTP_PASSWORD; do
+                      ERASER_SMTP_HOST ERASER_SMTP_PORT ERASER_SMTP_USERNAME ERASER_SMTP_PASSWORD \
+                      ERASER_HISTORY_KEY; do
             eval "value=\${$name}"
             [ -n "$value" ] || missing="$missing $name"
           done
@@ -57,18 +59,38 @@ jobs:
       - name: Build Eraser
         run: go build -o eraser ./cmd/eraser
 
+      - name: Test Eraser
+        run: go test ./...
+
       - name: Restore request history
         env:
           GH_TOKEN: ${{ github.token }}
+          ERASER_HISTORY_KEY: ${{ secrets.ERASER_HISTORY_KEY }}
         run: |
+          set -e
           mkdir -p ~/.eraser
+          history_dir=$(mktemp -d)
           run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow main.yml \
             --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-          if [ -n "$run_id" ] && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-               -n eraser-history -D ~/.eraser 2>/dev/null; then
-            echo "Restored history from run $run_id"
-          else
+          if [ -z "$run_id" ]; then
             echo "::warning::No prior history found — treating every broker as uncontacted."
+          elif [ -z "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+                    --jq '.artifacts[] | select(.name == "eraser-history") | .id' | head -n 1)" ]; then
+            echo "::warning::No prior history found — treating every broker as uncontacted."
+          else
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              -n eraser-history -D "$history_dir"
+            if [ -f "$history_dir/history.db.enc" ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -d \
+                -pass env:ERASER_HISTORY_KEY -in "$history_dir/history.db.enc" \
+                -out ~/.eraser/history.db
+            elif [ -f "$history_dir/history.db" ]; then
+              mv "$history_dir/history.db" ~/.eraser/history.db
+            else
+              echo "::error::The eraser-history artifact contains no history database."
+              exit 1
+            fi
+            echo "Restored history from run $run_id"
           fi
 
       - name: Write config
@@ -135,8 +157,8 @@ jobs:
                 provider: "gmail",
                 email: $user,
                 password: $pass,
-                folder: "INBOX",
-                auto_archive: true,
+                folder: "Eraser",
+                auto_archive: false,
                 archive_folder: "Eraser"
               }
             }' > ~/.eraser/config.yaml
@@ -151,22 +173,67 @@ jobs:
             ./eraser send
           fi
 
-      - name: File broker replies out of the inbox
+      - name: Monitor broker replies
         # Best effort: emails are already sent, so an IMAP hiccup must not fail the run.
         continue-on-error: true
-        run: ./eraser monitor --once --days 45
+        run: |
+          echo "ERASER_RUN_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          ./eraser monitor --once --days 35
+
+      - name: Confirm broker links
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            ./eraser confirm --pending --dry-run
+          else
+            ./eraser confirm --pending
+          fi
+
+      - name: Fill and submit broker forms
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: skipping browser form filling"
+          else
+            ./eraser fill --pending --submit --headless=true
+          fi
+
+      - name: Send monthly digest
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            ./eraser digest --dry-run
+          else
+            ./eraser digest
+          fi
 
       - name: Save request history
         if: always()
+        env:
+          ERASER_HISTORY_KEY: ${{ secrets.ERASER_HISTORY_KEY }}
         run: |
+          set -e
           mkdir -p artifact
-          cp ~/.eraser/history.db artifact/history.db 2>/dev/null || echo "no history db to save"
+          if [ -f ~/.eraser/history.db ]; then
+            [ -n "$ERASER_HISTORY_KEY" ] || { echo "::error::ERASER_HISTORY_KEY is missing"; exit 1; }
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+              -pass env:ERASER_HISTORY_KEY -in ~/.eraser/history.db \
+              -out artifact/history.db.enc
+          else
+            echo "no history db to save"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: eraser-history
-          path: artifact/history.db
+          path: artifact/history.db.enc
           retention-days: 90
           overwrite: true
           if-no-files-found: warn

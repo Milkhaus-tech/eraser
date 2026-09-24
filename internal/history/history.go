@@ -74,6 +74,8 @@ type BrokerResponse struct {
 	ReceivedAt   time.Time
 	ProcessedAt  time.Time
 	CreatedAt    time.Time
+	ActionStatus string
+	ActionAt     time.Time
 }
 
 // PendingTask represents a task that needs human intervention
@@ -139,6 +141,13 @@ func (s *Store) migrate() error {
 	s.db.Exec(`ALTER TABLE removal_requests ADD COLUMN pipeline_status TEXT DEFAULT 'email_sent'`)
 	s.db.Exec(`ALTER TABLE pending_tasks ADD COLUMN opened_at DATETIME`)
 	s.db.Exec(`ALTER TABLE broker_responses ADD COLUMN email_body TEXT`)
+	s.db.Exec(`ALTER TABLE broker_responses ADD COLUMN action_status TEXT DEFAULT 'pending'`)
+	s.db.Exec(`ALTER TABLE broker_responses ADD COLUMN action_at DATETIME`)
+	// Retain the oldest copy before enforcing uniqueness on upgraded databases.
+	s.db.Exec(`DELETE FROM broker_responses WHERE id NOT IN (
+		SELECT MIN(id) FROM broker_responses
+		GROUP BY broker_id, email_from, email_subject, received_at
+	)`)
 
 	query := `
 	CREATE TABLE IF NOT EXISTS removal_requests (
@@ -175,12 +184,16 @@ func (s *Store) migrate() error {
 		needs_review INTEGER DEFAULT 0,
 		received_at DATETIME,
 		processed_at DATETIME,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		action_status TEXT DEFAULT 'pending',
+		action_at DATETIME
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_br_broker_id ON broker_responses(broker_id);
 	CREATE INDEX IF NOT EXISTS idx_br_response_type ON broker_responses(response_type);
 	CREATE INDEX IF NOT EXISTS idx_br_needs_review ON broker_responses(needs_review);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_br_dedupe
+		ON broker_responses(broker_id, email_from, email_subject, received_at);
 
 	-- Pending tasks table (for CAPTCHAs, manual forms, etc.)
 	CREATE TABLE IF NOT EXISTS pending_tasks (
@@ -364,7 +377,11 @@ func (s *Store) AddBrokerResponse(resp *BrokerResponse) error {
 	query := `
 	INSERT INTO broker_responses (broker_id, broker_name, response_type, email_from, email_subject, email_body,
 		form_url, confirm_url, confidence, needs_review, received_at, processed_at, created_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+	WHERE NOT EXISTS (
+		SELECT 1 FROM broker_responses
+		WHERE broker_id = ? AND email_from = ? AND email_subject = ? AND received_at = ?
+	)
 	`
 
 	needsReview := 0
@@ -376,17 +393,122 @@ func (s *Store) AddBrokerResponse(resp *BrokerResponse) error {
 		resp.BrokerID, resp.BrokerName, resp.ResponseType, resp.EmailFrom, resp.EmailSubject, resp.EmailBody,
 		resp.FormURL, resp.ConfirmURL, resp.Confidence, needsReview,
 		resp.ReceivedAt, time.Now(), time.Now(),
+		resp.BrokerID, resp.EmailFrom, resp.EmailSubject, resp.ReceivedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert broker response: %w", err)
 	}
 
-	id, err := result.LastInsertId()
+	inserted, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("failed to get last insert id: %w", err)
+		return fmt.Errorf("failed to inspect broker response insert: %w", err)
 	}
-	resp.ID = id
+	if inserted > 0 {
+		resp.ID, err = result.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("failed to get last insert id: %w", err)
+		}
+	}
 	return nil
+}
+
+// GetPendingActionResponses returns action URLs that have not been attempted.
+func (s *Store) GetPendingActionResponses(responseType string, limit int) ([]BrokerResponse, error) {
+	return s.getActionResponses(responseType, "pending", limit)
+}
+
+// GetFailedActionResponses returns unreported failed or skipped actions.
+func (s *Store) GetFailedActionResponses(limit int) ([]BrokerResponse, error) {
+	return s.getActionResponsesByStatuses("", []string{"failed", "skipped"}, limit)
+}
+
+func (s *Store) getActionResponses(responseType, actionStatus string, limit int) ([]BrokerResponse, error) {
+	return s.getActionResponsesByStatuses(responseType, []string{actionStatus}, limit)
+}
+
+func (s *Store) getActionResponsesByStatuses(responseType string, actionStatuses []string, limit int) ([]BrokerResponse, error) {
+	query := `SELECT id, broker_id, broker_name, response_type, email_from, email_subject,
+		form_url, confirm_url, confidence, needs_review, received_at, processed_at, created_at,
+		COALESCE(action_status, 'pending'), action_at
+		FROM broker_responses WHERE COALESCE(action_status, 'pending') IN (`
+	args := make([]any, 0, len(actionStatuses)+2)
+	for i, status := range actionStatuses {
+		if i > 0 {
+			query += `, `
+		}
+		query += `?`
+		args = append(args, status)
+	}
+	query += `)`
+	if responseType != "" {
+		query += ` AND response_type = ?`
+		args = append(args, responseType)
+	}
+	query += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query action responses: %w", err)
+	}
+	defer rows.Close()
+	var responses []BrokerResponse
+	for rows.Next() {
+		var r BrokerResponse
+		var formURL, confirmURL sql.NullString
+		var receivedAt, processedAt, createdAt, actionAt sql.NullTime
+		var needsReview int
+		if err := rows.Scan(&r.ID, &r.BrokerID, &r.BrokerName, &r.ResponseType, &r.EmailFrom,
+			&r.EmailSubject, &formURL, &confirmURL, &r.Confidence, &needsReview,
+			&receivedAt, &processedAt, &createdAt, &r.ActionStatus, &actionAt); err != nil {
+			return nil, fmt.Errorf("failed to scan action response: %w", err)
+		}
+		r.FormURL, r.ConfirmURL = formURL.String, confirmURL.String
+		r.NeedsReview = needsReview != 0
+		r.ReceivedAt, r.ProcessedAt, r.CreatedAt, r.ActionAt = receivedAt.Time, processedAt.Time, createdAt.Time, actionAt.Time
+		responses = append(responses, r)
+	}
+	return responses, rows.Err()
+}
+
+// MarkBrokerResponsesReported prevents delivered digest entries from recurring.
+func (s *Store) MarkBrokerResponsesReported(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin reported update: %w", err)
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE broker_responses SET action_status = 'reported', action_at = ?
+			WHERE id = ? AND action_status IN ('failed', 'skipped')`, time.Now(), id); err != nil {
+			return fmt.Errorf("failed to mark broker response reported: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit reported updates: %w", err)
+	}
+	return nil
+}
+
+// SetBrokerResponseAction records the terminal result of an automated action.
+func (s *Store) SetBrokerResponseAction(id int64, status string) error {
+	_, err := s.db.Exec(`UPDATE broker_responses SET action_status = ?, action_at = ? WHERE id = ?`, status, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to update broker response action: %w", err)
+	}
+	return nil
+}
+
+// GetAutomationTally counts successful automated actions since the supplied time.
+func (s *Store) GetAutomationTally(since time.Time) (confirmed, submitted int, err error) {
+	query := `SELECT
+		COALESCE(SUM(CASE WHEN response_type='confirmation_required' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN response_type='form_required' THEN 1 ELSE 0 END), 0)
+		FROM broker_responses WHERE action_status='succeeded' AND action_at >= ?`
+	err = s.db.QueryRow(query, since).Scan(&confirmed, &submitted)
+	return
 }
 
 // FindBrokerResponseBySubject finds an existing response by broker_id and email_subject
