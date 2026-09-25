@@ -62,3 +62,40 @@ func TestMarkBrokerResponsesReported(t *testing.T) {
 		t.Fatalf("got %d reportable responses after marking reported, want 0", len(responses))
 	}
 }
+
+func TestActionResponsesReadDriverTextTimestamps(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	_, err = store.db.Exec(`
+		INSERT INTO broker_responses (
+			broker_id, broker_name, response_type, email_from, email_subject, form_url, confidence,
+			received_at, processed_at, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"broker", "Broker", "form_required", "reply@example.com", "Reply",
+		"https://b.example/form", 1.0,
+		"2026-09-01 10:36:35 -0500 -0500",
+		"2026-09-25 07:26:08.5677 +0000 UTC m=+19.79",
+		"2026-09-25 07:26:08.5677 +0000 UTC m=+19.79",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	responses, err := store.GetPendingActionResponses("form_required", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("got %d responses, want 1", len(responses))
+	}
+	if responses[0].ReceivedAt.IsZero() {
+		t.Error("ReceivedAt is zero")
+	}
+	if responses[0].ProcessedAt.IsZero() {
+		t.Error("ProcessedAt is zero")
+	}
+}

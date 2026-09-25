@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -455,7 +456,7 @@ func (s *Store) getActionResponsesByStatuses(responseType string, actionStatuses
 	for rows.Next() {
 		var r BrokerResponse
 		var formURL, confirmURL sql.NullString
-		var receivedAt, processedAt, createdAt, actionAt sql.NullTime
+		var receivedAt, processedAt, createdAt, actionAt sql.NullString
 		var needsReview int
 		if err := rows.Scan(&r.ID, &r.BrokerID, &r.BrokerName, &r.ResponseType, &r.EmailFrom,
 			&r.EmailSubject, &formURL, &confirmURL, &r.Confidence, &needsReview,
@@ -464,10 +465,24 @@ func (s *Store) getActionResponsesByStatuses(responseType string, actionStatuses
 		}
 		r.FormURL, r.ConfirmURL = formURL.String, confirmURL.String
 		r.NeedsReview = needsReview != 0
-		r.ReceivedAt, r.ProcessedAt, r.CreatedAt, r.ActionAt = receivedAt.Time, processedAt.Time, createdAt.Time, actionAt.Time
+		r.ReceivedAt, r.ProcessedAt = parseStoredTime(receivedAt.String), parseStoredTime(processedAt.String)
+		r.CreatedAt, r.ActionAt = parseStoredTime(createdAt.String), parseStoredTime(actionAt.String)
 		responses = append(responses, r)
 	}
 	return responses, rows.Err()
+}
+
+// parseStoredTime reads timestamps the sqlite driver wrote as text (time.Time.String form).
+func parseStoredTime(s string) time.Time {
+	if i := strings.Index(s, " m="); i >= 0 {
+		s = s[:i]
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05.999999999 -0700 MST", "2006-01-02 15:04:05.999999999 -0700 -0700", time.RFC3339Nano, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // MarkBrokerResponsesReported prevents delivered digest entries from recurring.
