@@ -1,5 +1,17 @@
 # Eraser
 
+> **This is my fork of [digisamroc/eraser](https://github.com/digisamroc/eraser).** I run it
+> once a month from GitHub Actions. What I changed:
+>
+> - **No repeat emails.** Each broker gets one request per 180 days, at most 400 a run (under
+>   Gmail's daily limit), and the send history carries over between runs, encrypted.
+> - **Date of birth** gets passed through to the request templates and opt-out forms.
+> - **Broker replies get handled.** It clicks confirmation links, fills in opt-out forms, and
+>   emails me a digest of whatever still needs a person.
+> - **[The monthly workflow](.github/workflows/main.yml)** that runs all of it.
+>
+> Everything below is the upstream README.
+
 Take back your privacy. Eraser sends data removal requests to 750+ data brokers on your behalf—for free.
 
 You know those sites like Spokeo, BeenVerified, and Whitepages that have your home address, phone number, and family members' names? They're called data brokers, and there are hundreds of them. Services like Incogni and DeleteMe charge $100+/year to send opt-out requests to these companies. Eraser does the same thing, but it's open source and completely free.
