@@ -111,7 +111,9 @@ func (b *Browser) Close() {
 }
 
 // NavigateAndFill navigates to a URL and attempts to fill any opt-out form
-func (b *Browser) NavigateAndFill(url string, brokerID string, autoSubmit bool) (*FormResult, error) {
+// allow is checked against where the page actually landed, right before any field is
+// filled, so a trusted link that redirects cannot carry the profile somewhere else.
+func (b *Browser) NavigateAndFill(url string, brokerID string, autoSubmit bool, allow func(string) bool) (*FormResult, error) {
 	result := &FormResult{
 		URL:      url,
 		BrokerID: brokerID,
@@ -170,6 +172,16 @@ func (b *Browser) NavigateAndFill(url string, brokerID string, autoSubmit bool) 
 			result.ErrorMessage = fmt.Sprintf("Blocking CAPTCHA detected: %s - use --wait flag to solve manually", blockingCaptcha.Type)
 			return result, nil
 		}
+	}
+
+	var landed string
+	if err := chromedp.Run(ctx, chromedp.Location(&landed)); err != nil {
+		result.ErrorMessage = fmt.Sprintf("could not read the page location: %v", err)
+		return result, err
+	}
+	if allow != nil && !allow(landed) {
+		result.ErrorMessage = "the link landed on an untrusted host; nothing was filled"
+		return result, fmt.Errorf("%s", result.ErrorMessage)
 	}
 
 	// PHASE 2: Fill form fields (either no blocking CAPTCHA, or user already solved it)

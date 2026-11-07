@@ -10,6 +10,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// sharedHosts are platforms anyone can get an address or a form on, so seeing one on a broker
+// record proves nothing about who runs a given mailbox or page.
+var sharedHosts = []string{
+	"gmail.com", "googlemail.com", "hotmail.com", "outlook.com", "live.com", "msn.com",
+	"yahoo.com", "aol.com", "icloud.com", "me.com", "protonmail.com", "proton.me", "gmx.com",
+	"mail.com", "zoho.com", "yandex.com",
+	"google.com", "forms.gle", "goo.gl", "bit.ly", "zendesk.com", "hsforms.com", "hubspot.com",
+	"onetrust.com", "trustarc.com", "formstack.com", "typeform.com", "jotform.com", "wufoo.com",
+	"surveymonkey.com", "cognitoforms.com", "airtable.com", "microsoft.com", "office.com",
+	"saymine.io", "bigidprivacy.cloud", "privacypillar.com", "github.io",
+}
+
+// IsSharedHost reports whether host is, or sits under, one of sharedHosts.
+func IsSharedHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, shared := range sharedHosts {
+		if host == shared || strings.HasSuffix(host, "."+shared) {
+			return true
+		}
+	}
+	return false
+}
+
 func isValidURL(rawURL string) bool {
 	if rawURL == "" {
 		return true

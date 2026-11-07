@@ -22,6 +22,18 @@ permissions:
   actions: read
 
 jobs:
+  # GitHub stops a public repo's schedule after 60 days without activity. Re-enabling on every
+  # run resets that clock, and this job has no dependency on the send job succeeding.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the schedule enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/main.yml/enable"
+
   eraser:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -70,12 +82,19 @@ jobs:
           set -e
           mkdir -p ~/.eraser
           history_dir=$(mktemp -d)
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow main.yml \
-            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          # The newest run that saved history, whatever its result: a run cancelled at the
+          # timeout still sent mail, and skipping it would re-email those brokers next month.
+          run_id=""
+          for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow main.yml \
+                        --limit 20 --json databaseId,status \
+                        --jq '.[] | select(.status == "completed") | .databaseId'); do
+            if [ -n "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                       --jq '.artifacts[] | select(.name == "eraser-history" and .expired == false) | .id' | head -n 1)" ]; then
+              run_id=$id
+              break
+            fi
+          done
           if [ -z "$run_id" ]; then
-            echo "::warning::No prior history found — treating every broker as uncontacted."
-          elif [ -z "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
-                    --jq '.artifacts[] | select(.name == "eraser-history") | .id' | head -n 1)" ]; then
             echo "::warning::No prior history found — treating every broker as uncontacted."
           else
             gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \

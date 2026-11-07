@@ -314,8 +314,9 @@ func runSend() error {
 
 		last, err := store.GetLastRequestForBroker(b.ID)
 		if err != nil {
-			fmt.Printf("  ⚠️  Could not read history for %s: %v\n", b.Name, err)
-		} else if shouldSkipBroker(last, cfg.Options.ResendAfterDays, time.Now()) {
+			return fmt.Errorf("could not read history for %s, so not sending: an unreadable history would re-email every broker: %w", b.Name, err)
+		}
+		if shouldSkipBroker(last, cfg.Options.ResendAfterDays, time.Now()) {
 			skipCount++
 			continue
 		}
@@ -726,6 +727,7 @@ func runMonitor(days int, once bool, watch bool) error {
 	var responses []inbox.ClassifiedResponse
 	for _, email := range emails {
 		classified := inbox.ClassifyResponse(&email)
+		inbox.GuardActions(&email, &classified)
 		responses = append(responses, classified)
 
 		// Store in database
@@ -829,6 +831,7 @@ func runMonitor(days int, once bool, watch bool) error {
 			}
 
 			classified := inbox.ClassifyResponse(&email)
+			inbox.GuardActions(&email, &classified)
 			printClassifiedResponse(classified)
 
 			// Store response
@@ -1026,7 +1029,7 @@ func runFill(brokerID, formURL string, headless, autoSubmit bool, screenshotDir 
 	if err != nil {
 		return fmt.Errorf("failed to load brokers: %w", err)
 	}
-	domainHandler := browser.NewConfirmationHandler(browser.BrokerDomains(brokerDB.Brokers))
+	domainHandler := browser.NewBrokerHandler(brokerDB.Brokers)
 
 	// Set default screenshot directory
 	if screenshotDir == "" {
@@ -1149,7 +1152,7 @@ func runFill(brokerID, formURL string, headless, autoSubmit bool, screenshotDir 
 
 	// Process each form
 	for i, form := range formsToFill {
-		valid, host, validationErr := domainHandler.ValidateDomain(form.URL)
+		valid, host, validationErr := domainHandler.ValidateForBroker(form.URL, form.BrokerID)
 		if validationErr != nil || !valid {
 			fmt.Printf("[%d/%d] Skipping untrusted form host: %s\n", i+1, len(formsToFill), host)
 			if form.ResponseID > 0 {
@@ -1163,7 +1166,11 @@ func runFill(brokerID, formURL string, headless, autoSubmit bool, screenshotDir 
 			fmt.Printf("       Broker: %s\n", form.BrokerID)
 		}
 
-		result, err := b.NavigateAndFill(form.URL, form.BrokerID, autoSubmit)
+		brokerID := form.BrokerID
+		result, err := b.NavigateAndFill(form.URL, form.BrokerID, autoSubmit, func(landed string) bool {
+			ok, _, checkErr := domainHandler.ValidateForBroker(landed, brokerID)
+			return checkErr == nil && ok
+		})
 		if err != nil {
 			fmt.Printf("       ❌ Form attempt failed\n")
 			if os.Getenv("CI") == "" {
@@ -1323,7 +1330,7 @@ func runConfirm(confirmURL, brokerID string, pending, validateDomain, dryRun boo
 	defer store.Close()
 
 	// Create confirmation handler
-	handler := browser.NewConfirmationHandler(browser.BrokerDomains(brokerDB.Brokers))
+	handler := browser.NewBrokerHandler(brokerDB.Brokers)
 
 	fmt.Println("🔗 Confirmation Link Handler")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -1414,7 +1421,7 @@ func runConfirm(confirmURL, brokerID string, pending, validateDomain, dryRun boo
 
 		// Validate domain if requested
 		if validateDomain {
-			valid, domain, err := handler.ValidateDomain(link.URL)
+			valid, domain, err := handler.ValidateForBroker(link.URL, link.BrokerID)
 			if err != nil {
 				fmt.Printf("       ❌ Invalid URL\n")
 				failCount++

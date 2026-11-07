@@ -1,11 +1,14 @@
 package inbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
+	netmail "net/mail"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,9 +21,10 @@ import (
 
 // Monitor handles IMAP connection and email monitoring
 type Monitor struct {
-	config  config.InboxConfig
-	client  *client.Client
-	brokers map[string]broker.Broker // Map of email domain to broker
+	config    config.InboxConfig
+	client    *client.Client
+	brokers   map[string]broker.Broker // Map of email domain to broker
+	addresses map[string]broker.Broker // Exact address to broker, the only match on a shared mail host
 }
 
 // Email represents a parsed email from a broker
@@ -36,34 +40,89 @@ type Email struct {
 	ReceivedAt time.Time
 	BrokerID   string // Matched broker ID (if found)
 	BrokerName string // Matched broker name (if found)
+	// Authenticated is true when the receiving server's own verdict is a DMARC pass for FromDomain.
+	Authenticated bool
 }
 
 // NewMonitor creates a new inbox monitor
 func NewMonitor(cfg config.InboxConfig, brokerList []broker.Broker) *Monitor {
 	// Build a map of email domains to brokers for quick lookup
 	brokerMap := make(map[string]broker.Broker)
+	addresses := make(map[string]broker.Broker)
 	for _, b := range brokerList {
 		// Extract domain from broker email
 		if b.Email != "" {
 			parts := strings.Split(b.Email, "@")
 			if len(parts) == 2 {
 				domain := strings.ToLower(parts[1])
-				brokerMap[domain] = b
+				addresses[strings.ToLower(b.Email)] = b
+				if !broker.IsSharedHost(domain) {
+					brokerMap[domain] = b
+				}
 			}
 		}
 		// Also map by website domain
 		if b.Website != "" {
 			domain := extractDomain(b.Website)
-			if domain != "" {
+			if domain != "" && !broker.IsSharedHost(domain) {
 				brokerMap[domain] = b
 			}
 		}
 	}
 
 	return &Monitor{
-		config:  cfg,
-		brokers: brokerMap,
+		config:    cfg,
+		brokers:   brokerMap,
+		addresses: addresses,
 	}
+}
+
+// matchBroker finds who sent a message: by exact address, else by domain. A shared mail host
+// is never in the domain map, so a stranger at gmail.com is not one of the Gmail brokers.
+func (m *Monitor) matchBroker(address, domain string) (broker.Broker, bool) {
+	if b, ok := m.addresses[strings.ToLower(address)]; ok {
+		return b, true
+	}
+	b, ok := m.brokers[domain]
+	return b, ok
+}
+
+// trustedAuthServ is the server whose Authentication-Results header is believed. Any other
+// inbox provider reads as unauthenticated, which sends replies to review, not to a browser.
+const trustedAuthServ = "mx.google.com"
+
+var (
+	headerComment = regexp.MustCompile(`\([^()]*\)`)
+	dmarcVerdict  = regexp.MustCompile(`\bdmarc=([a-z]+)[^;]*\bheader\.from=([^\s;]+)`)
+)
+
+// dmarcPassed reads the top Authentication-Results header of a raw message. Receivers prepend
+// theirs, so the top one is the only one a sender cannot have written themselves.
+func dmarcPassed(raw []byte, fromDomain string) bool {
+	msg, err := netmail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return false
+	}
+	results := msg.Header["Authentication-Results"]
+	if len(results) == 0 {
+		return false
+	}
+	top := strings.ToLower(headerComment.ReplaceAllString(results[0], ""))
+	if !strings.HasPrefix(strings.TrimSpace(top), trustedAuthServ+";") {
+		return false
+	}
+	verdict := dmarcVerdict.FindStringSubmatch(top)
+	return verdict != nil && verdict[1] == "pass" && verdict[2] == strings.ToLower(fromDomain)
+}
+
+// GuardActions drops a reply's links unless its sender passed DMARC. Following them fills
+// forms with name, address and birth date, so an unproven sender gets a human review instead.
+func GuardActions(email *Email, c *ClassifiedResponse) {
+	if email.Authenticated || (c.FormURL == "" && c.ConfirmURL == "") {
+		return
+	}
+	c.FormURL, c.ConfirmURL, c.NeedsReview = "", "", true
+	c.Reason += "; sender did not pass DMARC, so its links are left for review"
 }
 
 // extractDomain extracts the domain from a URL
@@ -209,7 +268,7 @@ func (m *Monitor) parseMessage(msg *imap.Message, section *imap.BodySectionName)
 
 	// Try to match to a known broker
 	if email.FromDomain != "" {
-		if b, ok := m.brokers[email.FromDomain]; ok {
+		if b, ok := m.matchBroker(email.From, email.FromDomain); ok {
 			email.BrokerID = b.ID
 			email.BrokerName = b.Name
 		}
@@ -220,8 +279,13 @@ func (m *Monitor) parseMessage(msg *imap.Message, section *imap.BodySectionName)
 	if r == nil {
 		return email, nil
 	}
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return email, nil
+	}
+	email.Authenticated = dmarcPassed(raw, email.FromDomain)
 
-	mr, err := mail.CreateReader(r)
+	mr, err := mail.CreateReader(bytes.NewReader(raw))
 	if err != nil {
 		return email, nil // Return without body on parse error
 	}

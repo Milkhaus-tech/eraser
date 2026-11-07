@@ -22,14 +22,15 @@ type ConfirmationResult struct {
 	RedirectPath []string
 }
 
-// BrokerDomains returns every trusted domain advertised for a broker. Hosts
-// from the website, form URL, and email address are all valid trust anchors.
+// BrokerDomains returns every trusted domain advertised for a broker. Hosts from the
+// website, form URL, and email address are trust anchors, except shared platforms, where
+// only a broker's exact opt-out URL counts (see NewBrokerHandler).
 func BrokerDomains(brokers []broker.Broker) []string {
 	seen := make(map[string]bool)
 	var domains []string
 	add := func(host string) {
 		host = strings.ToLower(strings.TrimPrefix(host, "www."))
-		if host != "" && !seen[host] {
+		if host != "" && !seen[host] && !broker.IsSharedHost(host) {
 			seen[host] = true
 			domains = append(domains, host)
 		}
@@ -51,6 +52,31 @@ func BrokerDomains(brokers []broker.Broker) []string {
 type ConfirmationHandler struct {
 	client        *http.Client
 	brokerDomains map[string]bool
+	sharedForms   map[string]map[string]bool // formKey -> broker IDs that published that exact form
+}
+
+// formKey identifies a form by host and path. The query is left out because links to the
+// same form differ in tracking parameters; the path is what names the form.
+func formKey(u *url.URL) string {
+	return strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.") + strings.TrimRight(u.Path, "/")
+}
+
+// NewBrokerHandler is NewConfirmationHandler for a broker list, also trusting each exact
+// opt-out URL that lives on a shared platform.
+func NewBrokerHandler(brokers []broker.Broker) *ConfirmationHandler {
+	h := NewConfirmationHandler(BrokerDomains(brokers))
+	for _, b := range brokers {
+		u, err := url.Parse(b.OptOutURL)
+		if err != nil || !broker.IsSharedHost(u.Hostname()) {
+			continue
+		}
+		key := formKey(u)
+		if h.sharedForms[key] == nil {
+			h.sharedForms[key] = make(map[string]bool)
+		}
+		h.sharedForms[key][b.ID] = true
+	}
+	return h
 }
 
 // NewConfirmationHandler creates a new handler with known broker domains
@@ -84,6 +110,7 @@ func NewConfirmationHandler(brokerDomains []string) *ConfirmationHandler {
 			},
 		},
 		brokerDomains: domains,
+		sharedForms:   make(map[string]map[string]bool),
 	}
 }
 
@@ -99,6 +126,11 @@ func (h *ConfirmationHandler) ValidateDomain(confirmURL string) (bool, string, e
 		return false, host, fmt.Errorf("URL must use http or https and include a host")
 	}
 
+	// A shared platform never trusts by host: anyone can publish a form on it.
+	if broker.IsSharedHost(host) {
+		return len(h.sharedForms[formKey(parsed)]) > 0, host, nil
+	}
+
 	// Check exact match
 	if h.brokerDomains[host] {
 		return true, host, nil
@@ -112,6 +144,20 @@ func (h *ConfirmationHandler) ValidateDomain(confirmURL string) (bool, string, e
 	}
 
 	return false, host, nil
+}
+
+// ValidateForBroker is ValidateDomain for a link in one broker's reply: a form on a shared
+// platform must be the one that broker published, not merely some broker's.
+func (h *ConfirmationHandler) ValidateForBroker(rawURL, brokerID string) (bool, string, error) {
+	valid, host, err := h.ValidateDomain(rawURL)
+	if err != nil || !valid || brokerID == "" || !broker.IsSharedHost(host) {
+		return valid, host, err
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false, host, err
+	}
+	return h.sharedForms[formKey(parsed)][brokerID], host, nil
 }
 
 // ClickConfirmationLink sends a GET request to the confirmation URL
